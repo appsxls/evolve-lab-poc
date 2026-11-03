@@ -1,47 +1,28 @@
 #!/usr/bin/env python3
-"""Local-only proof of concept. NOT a production-safe multi-tenant agent runtime."""
-import json, os, pathlib, subprocess, threading, time, uuid, mimetypes, shutil, sys
+"""Local HTTP backend with an adapter boundary for cloud development agents."""
+import json, os, pathlib, threading, time, uuid, mimetypes
+
+from agents import Agent, CloudAgent
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
 
 ROOT = pathlib.Path(__file__).resolve().parent
 APP = ROOT/'managed_app'
 RUNTIME = ROOT/'runtime'
-WORKSPACES = RUNTIME/'workspaces'
 STATE = RUNTIME/'state.json'
 HOST = '127.0.0.1'
 PORT = int(os.getenv('PORT', '8765'))
 LOCK = threading.RLock()
 JOBS = {}
+AGENT: Agent = CloudAgent()
 STATE_DATA = {'tasks': [{'id':'t1','title':'Prepare project proposal','done':True}, {'id':'t2','title':'Review application design','done':False}, {'id':'t3','title':'Test new functionality','done':False}]}
-
-
-def find_codex():
-    # On Windows npm creates codex.cmd and codex.ps1 wrappers.
-    # PowerShell resolves codex.ps1, but subprocess needs an executable
-    # launcher; prefer the .cmd wrapper for subprocess on Windows.
-    return shutil.which('codex.cmd') if os.name == 'nt' else shutil.which('codex')
-
-
-def git(*args, cwd=APP, check=True):
-    return subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True, check=check)
 
 
 def init():
     RUNTIME.mkdir(exist_ok=True)
-    WORKSPACES.mkdir(exist_ok=True)
     if STATE.exists():
         try: STATE_DATA.update(json.loads(STATE.read_text()))
         except (ValueError, OSError): pass
-    if not (APP/'.git').exists():
-        git('init', '-b', 'main')
-        git('config', 'user.name', 'Local Codex POC')
-        git('config', 'user.email', 'poc@localhost.invalid')
-        git('add', '.')
-        git('commit', '-m', 'Initial task manager')
-    else:
-        git('config', 'user.name', 'Local Codex POC')
-        git('config', 'user.email', 'poc@localhost.invalid')
 
 
 def save_state():
@@ -60,74 +41,18 @@ def safe_job(job):
 
 def run_job(job_id):
     job = JOBS[job_id]
-    name = f"codex-{job_id[:8]}"
-    workspace = WORKSPACES/name
     try:
-        if os.getenv('POC_ALLOW_CODEX') != '1':
-            raise RuntimeError('Real Codex execution is disabled. Set POC_ALLOW_CODEX=1 after reviewing the README.')
-        if not find_codex():
-            raise RuntimeError('Codex CLI is not installed or not in PATH. See README.md.')
         with LOCK:
             job['status'] = 'running'
-        send_event(job, 'Creating isolated Git worktree')
-        git('worktree','add','-b',name,str(workspace),'main')
-        job['workspace'] = str(workspace)
-        send_event(job, 'Starting Codex coding task')
-        prompt = ('You are editing a small vanilla JS task manager prototype. '
-                  'Implement the user request in this workspace. Only change files under the current project. '
-                  'Preserve all existing functions; use no external dependencies. '
-                  'The files index.html, app.js, styles.css are served directly. '
-                  'Server-side task CRUD is outside this workspace; if a requested feature needs backend changes, '
-                  'explain that limitation and implement only what can safely be done in this frontend. '
-                  'Run node --check app.js and the Python test_app.py script before finishing. '
-                  'Never remove existing tests. Do not access outside the project. Request: '+job['request'])
-        cmd = [find_codex(),'exec','--json','--sandbox','workspace-write',prompt]
-        process = subprocess.Popen(cmd,cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
-        job['process']=process
-        deadline=time.time()+300
-        for line in process.stdout:
-            if time.time()>deadline:
-                process.kill()
-                raise RuntimeError('Codex execution exceeded 5 minutes')
-            try:
-                ev=json.loads(line)
-                typ=ev.get('type','event')
-                if typ in ('item.completed','item.started'):
-                    item=ev.get('item') or {}
-                    desc=item.get('type','activity')
-                    detail=item.get('text') or item.get('command') or ''
-                    send_event(job, f'{desc}: {str(detail)[:150]}')
-                elif 'failed' in typ:
-                    send_event(job, typ, 'warning')
-            except ValueError:
-                pass
-        result=process.wait(timeout=10)
-        stderr=process.stderr.read()[-1500:]
-        if result != 0:
-            raise RuntimeError(f'Codex exited with code {result}. {stderr}')
-        send_event(job, 'Running independent validation')
-        checks=[['node','--check','app.js'],[sys.executable,'test_app.py']]
-        for command in checks:
-            cp=subprocess.run(command,cwd=workspace,capture_output=True,text=True,timeout=30)
-            send_event(job, ' '.join(command)+': '+('PASS' if cp.returncode==0 else 'FAIL'))
-            if cp.returncode:
-                raise RuntimeError(f'Validation failed: {" ".join(command)}\n{(cp.stdout+cp.stderr)[-1500:]}')
-        changes=git('status','--porcelain',cwd=workspace).stdout
-        if not changes.strip():
-            raise RuntimeError('Codex finished without any file changes.')
-        git('add','.',cwd=workspace)
-        git('commit','-m',f'Codex change: {job["request"][:60]}',cwd=workspace)
-        with LOCK:
-            job['diff'] = git('diff','main...HEAD','--stat',cwd=workspace).stdout
-            job['status']='review'
-        send_event(job, 'Tests passed. Preview ready for review.', 'success')
+        send_event(job, 'Submitting development request to cloud agent')
+        AGENT.execute(job['request'])
+        # Phase one defines no successful artifact/review contract yet.
+        raise RuntimeError('Agent returned without a supported development result')
     except Exception as exc:
         with LOCK:
             job['status']='failed'
             job['error']=str(exc)
         send_event(job,str(exc),'error')
-    finally:
-        job.pop('process',None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -164,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         route=unquote(urlparse(self.path).path)
         if route=='/api/status':
-            self.reply(200, {'codexInstalled':bool(find_codex()),'codexEnabled':os.getenv('POC_ALLOW_CODEX')=='1','mode':'local prototype','revision':git('rev-parse','--short','HEAD').stdout.strip()})
+            self.reply(200, {'codexInstalled':False,'codexEnabled':False,'mode':'cloud agent prototype','revision':None,'agent':AGENT.status()})
         elif route=='/api/tasks':
             with LOCK: self.reply(200, STATE_DATA['tasks'])
         elif route=='/api/jobs':
@@ -201,22 +126,19 @@ class Handler(BaseHTTPRequestHandler):
             if route=='/api/jobs':
                 request=str(payload.get('request','')).strip()
                 if len(request)<8 or len(request)>1500: return self.reply(400,{'error':'Request must contain 8–1500 characters'})
-                if any(x['status']=='running' for x in JOBS.values()): return self.reply(409,{'error':'Another Codex task is running'})
-                jid=uuid.uuid4().hex
-                job={'id':jid,'request':request,'created':time.time(),'updated':time.time(),'status':'queued','events':[],'diff':'','error':''}
-                with LOCK: JOBS[jid]=job
+                with LOCK:
+                    if any(x['status'] in ('queued', 'running') for x in JOBS.values()):
+                        return self.reply(409,{'error':'Another development task is running'})
+                    jid=uuid.uuid4().hex
+                    job={'id':jid,'request':request,'created':time.time(),'updated':time.time(),'status':'queued','events':[],'diff':'','error':''}
+                    JOBS[jid]=job
                 threading.Thread(target=run_job,args=(jid,),daemon=True).start()
                 return self.reply(202,safe_job(job))
             if route.startswith('/api/jobs/') and route.endswith('/approve'):
                 jid=route.split('/')[-2]
                 job=JOBS.get(jid)
                 if not job or job['status']!='review': return self.reply(409,{'error':'Job is not ready for approval'})
-                if git('status','--porcelain').stdout.strip(): return self.reply(409,{'error':'Main workspace has uncommitted changes'})
-                cp=git('merge','--ff-only',f'codex-{jid[:8]}',check=False)
-                if cp.returncode: return self.reply(409,{'error':'Cannot fast-forward main: '+cp.stderr[-400:]})
-                with LOCK: job['status']='approved'
-                send_event(job,'Change merged into local main. Reload the application.', 'success')
-                return self.reply(200,{'ok':True})
+                return self.reply(409,{'error':'Cloud agent approval is not configured'})
             return self.reply(404,{'error':'Not found'})
         except Exception as e:
             self.reply(400,{'error':str(e)})
