@@ -1,3 +1,6 @@
 runtime/
 __pycache__/
 *.pyc
+
+managed_app.zip
+managed_app_git_backup/
