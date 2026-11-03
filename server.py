@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local-only proof of concept. NOT a production-safe multi-tenant agent runtime."""
-import json, os, pathlib, subprocess, threading, time, uuid, mimetypes, shutil
+import json, os, pathlib, subprocess, threading, time, uuid, mimetypes, shutil, sys
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, unquote
 
@@ -14,6 +14,13 @@ PORT = int(os.getenv('PORT', '8765'))
 LOCK = threading.RLock()
 JOBS = {}
 STATE_DATA = {'tasks': [{'id':'t1','title':'Prepare project proposal','done':True}, {'id':'t2','title':'Review application design','done':False}, {'id':'t3','title':'Test new functionality','done':False}]}
+
+
+def find_codex():
+    # On Windows npm creates codex.cmd and codex.ps1 wrappers.
+    # PowerShell resolves codex.ps1, but subprocess needs an executable
+    # launcher; prefer the .cmd wrapper for subprocess on Windows.
+    return shutil.which('codex.cmd') if os.name == 'nt' else shutil.which('codex')
 
 
 def git(*args, cwd=APP, check=True):
@@ -58,7 +65,7 @@ def run_job(job_id):
     try:
         if os.getenv('POC_ALLOW_CODEX') != '1':
             raise RuntimeError('Real Codex execution is disabled. Set POC_ALLOW_CODEX=1 after reviewing the README.')
-        if not shutil.which('codex'):
+        if not find_codex():
             raise RuntimeError('Codex CLI is not installed or not in PATH. See README.md.')
         with LOCK:
             job['status'] = 'running'
@@ -72,9 +79,9 @@ def run_job(job_id):
                   'The files index.html, app.js, styles.css are served directly. '
                   'Server-side task CRUD is outside this workspace; if a requested feature needs backend changes, '
                   'explain that limitation and implement only what can safely be done in this frontend. '
-                  'Run node --check app.js and python3 test_app.py before finishing. '
+                  'Run node --check app.js and the Python test_app.py script before finishing. '
                   'Never remove existing tests. Do not access outside the project. Request: '+job['request'])
-        cmd = ['codex','exec','--json','--sandbox','workspace-write','--ask-for-approval','never',prompt]
+        cmd = [find_codex(),'exec','--json','--sandbox','workspace-write',prompt]
         process = subprocess.Popen(cmd,cwd=workspace,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,bufsize=1)
         job['process']=process
         deadline=time.time()+300
@@ -99,7 +106,7 @@ def run_job(job_id):
         if result != 0:
             raise RuntimeError(f'Codex exited with code {result}. {stderr}')
         send_event(job, 'Running independent validation')
-        checks=[['node','--check','app.js'],['python3','test_app.py']]
+        checks=[['node','--check','app.js'],[sys.executable,'test_app.py']]
         for command in checks:
             cp=subprocess.run(command,cwd=workspace,capture_output=True,text=True,timeout=30)
             send_event(job, ' '.join(command)+': '+('PASS' if cp.returncode==0 else 'FAIL'))
@@ -157,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         route=unquote(urlparse(self.path).path)
         if route=='/api/status':
-            self.reply(200, {'codexInstalled':bool(shutil.which('codex')),'codexEnabled':os.getenv('POC_ALLOW_CODEX')=='1','mode':'local prototype','revision':git('rev-parse','--short','HEAD').stdout.strip()})
+            self.reply(200, {'codexInstalled':bool(find_codex()),'codexEnabled':os.getenv('POC_ALLOW_CODEX')=='1','mode':'local prototype','revision':git('rev-parse','--short','HEAD').stdout.strip()})
         elif route=='/api/tasks':
             with LOCK: self.reply(200, STATE_DATA['tasks'])
         elif route=='/api/jobs':
